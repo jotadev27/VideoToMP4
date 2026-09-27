@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -24,6 +25,7 @@ class Cancelled(Exception):
 
 @dataclass(frozen=True)
 class MediaInfo:
+    """Information needed to select codecs and calculate an output budget."""
     path: Path
     duration: float | None
     width: int
@@ -34,6 +36,7 @@ class MediaInfo:
     pixel_format: str
     audio_index: int | None
     audio_copy: bool
+    audio_bitrate: int | None
     hdr: bool
     size: int
 
@@ -137,32 +140,38 @@ def probe_media(path: Path, cancel: threading.Event | None = None) -> MediaInfo:
         pixel_format=pixel[0] if pixel else "unknown",
         audio_index=int(audio[1]) if audio else None,
         audio_copy=bool(audio and audio[2].startswith("aac ") and re.search(r"\b(mono|stereo)\b", audio[2])),
+        audio_bitrate=(int(re.search(r"(\d+) kb/s", audio[2])[1]) * 1000 if audio and re.search(r"(\d+) kb/s", audio[2]) else None),
         hdr="smpte2084" in video or "arib-std-b67" in video,
         size=path.stat().st_size,
     )
 
 
 def suggested_output(source: Path) -> Path:
-    base = source.with_suffix(".mp4")
-    if base == source or base.exists():
-        base = source.with_name(source.stem + "_converted.mp4")
-    number = 2
-    candidate = base
-    while candidate.exists():
-        candidate = base.with_name(f"{base.stem}_{number}.mp4")
-        number += 1
-    return candidate
+    """Save beside the source with a four-digit suffix; never reuse a name."""
+    for _ in range(100):
+        candidate = source.with_name(f"{source.stem}_extracted{secrets.randbelow(10000):04d}.mp4")
+        if not candidate.exists() and not candidate.is_symlink():
+            return candidate
+    raise ConversionError("Could not choose a free filename. Please select an output location.")
 
 
-def conversion_command(info: MediaInfo, destination: Path) -> list[str]:
+def conversion_command(
+    info: MediaInfo, destination: Path, *, copy_video: bool | None = None,
+    video_bitrate: int | None = None, audio_bitrate: int = 192_000,
+    copy_audio: bool | None = None, pass_number: int | None = None,
+    pass_log: Path | None = None,
+) -> list[str]:
+    """Build an argument list, never a shell command, for one FFmpeg pass."""
+    copy_video = info.video_copy if copy_video is None else copy_video
+    copy_audio = info.audio_copy if copy_audio is None else copy_audio
     command = [
         ffmpeg_executable(), "-hide_banner", "-nostdin", "-y", "-loglevel", "warning",
-        "-protocol_whitelist", "file,pipe,crypto,data", "-i", str(info.path),
+        "-xerror", "-protocol_whitelist", "file,pipe,crypto,data", "-i", str(info.path),
         "-map", f"0:{info.video_index}",
     ]
-    if info.audio_index is not None:
+    if info.audio_index is not None and pass_number != 1:
         command += ["-map", f"0:{info.audio_index}"]
-    if info.video_copy:
+    if copy_video:
         command += ["-c:v", "copy"]
     else:
         filters = []
@@ -175,16 +184,21 @@ def conversion_command(info: MediaInfo, destination: Path) -> list[str]:
         filters.append("pad=ceil(iw/2)*2:ceil(ih/2)*2")
         command += [
             "-vf", ",".join(filters), "-c:v", "libx264", "-preset", "slow",
-            "-crf", "16", "-pix_fmt", "yuv420p", "-profile:v", "high",
+            "-pix_fmt", "yuv420p", "-profile:v", "high",
             "-fps_mode", "passthrough",
         ]
+        command += ["-b:v", str(video_bitrate)] if video_bitrate else ["-crf", "18"]
+        if pass_number is not None:
+            command += ["-pass", str(pass_number), "-passlogfile", str(pass_log)]
         if info.hdr:
             command += ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
-    if info.audio_index is not None:
-        if info.audio_copy:
+    if info.audio_index is not None and pass_number != 1:
+        if copy_audio:
             command += ["-c:a", "copy"]
         else:
-            command += ["-c:a", "aac", "-b:a", "256k", "-ac", "2", "-ar", "48000"]
+            command += ["-c:a", "aac", "-b:a", str(audio_bitrate), "-ac", "2", "-ar", "48000"]
+    if pass_number == 1:
+        return command + ["-an", "-progress", "pipe:1", "-nostats", "-f", "null", os.devnull]
     command += [
         "-map_metadata", "0", "-map_chapters", "0", "-sn", "-dn",
         "-tag:v", "avc1", "-movflags", "+faststart", "-progress", "pipe:1",
@@ -204,6 +218,133 @@ def friendly_error(diagnostic: str) -> str:
     if "invalid data" in lower or "error while decoding" in lower:
         return "The video could not be decoded. It may be damaged or use an unsupported codec."
     return "Conversion failed. The video may be damaged or unsupported. Try another file or output location."
+
+
+def run_ffmpeg(
+    command: list[str], cancel: threading.Event,
+    progress: Callable[[float | None, str], None], duration: float | None,
+    start: float, span: float, message: str,
+) -> None:
+    """Drain progress while a separate watcher makes cancellation responsive."""
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=log, bufsize=1, **process_options(),
+        )
+        finished = threading.Event()
+
+        def watch_cancel() -> None:
+            while not finished.wait(0.1):
+                if cancel.is_set():
+                    stop_process(process)
+                    return
+
+        watcher = threading.Thread(target=watch_cancel, daemon=True)
+        watcher.start()
+        try:
+            progress(start if duration else None, message)
+            for line in process.stdout:
+                key, _, value = line.strip().partition("=")
+                if key == "out_time_us":
+                    try:
+                        seconds = max(0, int(value) / 1_000_000)
+                    except ValueError:
+                        continue
+                    percent = start + min(1, seconds / duration) * span if duration else None
+                    progress(percent, message)
+            return_code = process.wait()
+            if cancel.is_set():
+                raise Cancelled()
+            if return_code != 0:
+                log.seek(0)
+                raise ConversionError(friendly_error(log.read()))
+        finally:
+            finished.set()
+            stop_process(process)
+            watcher.join(timeout=4)
+            process.stdout.close()
+
+
+def encode_with_size_budget(
+    info: MediaInfo, temporary: Path, cancel: threading.Event,
+    progress: Callable[[float | None, str], None],
+) -> None:
+    """Prefer lossless remuxing; otherwise spend a bounded two-pass budget."""
+    maximum = info.size * 130 // 100
+    if info.video_copy:
+        run_ffmpeg(conversion_command(info, temporary), cancel, progress, info.duration, 0, 88, "Copying video…")
+        if temporary.stat().st_size <= maximum:
+            return
+    if not info.duration:
+        run_ffmpeg(conversion_command(info, temporary, copy_video=False), cancel, progress, None, 0, 88, "Converting…")
+        if temporary.stat().st_size <= maximum:
+            return
+        raise ConversionError("The duration is unknown and this conversion exceeds the +30% size limit. No output was saved.")
+
+    # Leave container overhead and retry headroom below the hard 130% limit.
+    budget = max(1, int(info.size * 1.12) - min(16_384, max(2048, info.size // 100)))
+    total_bitrate = max(1000, int(budget * 8 / info.duration))
+    audio_rate = min(192_000, max(16_000, int(total_bitrate * 0.15))) if info.audio_index is not None else 0
+    copy_audio = bool(info.audio_copy and info.audio_bitrate and info.audio_bitrate <= audio_rate)
+    if copy_audio:
+        audio_rate = info.audio_bitrate
+    video_rate = max(1000, total_bitrate - audio_rate)
+
+    # Unique pass logs avoid collisions between files or concurrent app windows.
+    with tempfile.TemporaryDirectory(prefix="video-to-mp4-pass-") as pass_directory:
+        pass_log = Path(pass_directory) / "statistics"
+        for attempt in range(3):
+            options = dict(
+                copy_video=False, video_bitrate=video_rate, audio_bitrate=audio_rate,
+                copy_audio=copy_audio, pass_log=pass_log,
+            )
+            run_ffmpeg(
+                conversion_command(info, temporary, pass_number=1, **options), cancel,
+                progress, info.duration, 0, 42, "Analyzing video…" if attempt == 0 else "Adjusting size…",
+            )
+            run_ffmpeg(
+                conversion_command(info, temporary, pass_number=2, **options), cancel,
+                progress, info.duration, 42, 46, "Converting…",
+            )
+            actual = temporary.stat().st_size
+            if actual <= maximum:
+                return
+            # Measured output, rather than a guessed CRF, governs subsequent attempts.
+            video_rate = max(1000, int(video_rate * min(0.85, info.size * 1.10 / actual)))
+            if audio_rate > 32_000:
+                copy_audio = False
+                audio_rate = max(32_000, int(audio_rate * 0.85))
+    raise ConversionError("This video could not fit the +30% size limit at its original resolution. No output was saved.")
+
+
+def enforce_size_range(path: Path, original_size: int, cancel: threading.Event) -> None:
+    """Enforce the requested 100–130% range without altering decoded media."""
+    actual = path.stat().st_size
+    maximum = original_size * 130 // 100
+    if not actual or actual > maximum:
+        raise ConversionError("The output exceeds the +30% size limit. No output was saved.")
+    if actual >= original_size:
+        return
+    # MP4 readers skip 'free' atoms. Padding respects the requested minimum
+    # without re-encoding an already good result; padding adds no visual detail.
+    missing = original_size - actual
+    atom_size = max(8, missing)
+    if actual + atom_size > maximum:
+        raise ConversionError("This very small file cannot fit the requested MP4 size range.")
+    with path.open("ab") as target:
+        if atom_size <= 0xFFFFFFFF:
+            target.write(atom_size.to_bytes(4, "big") + b"free")
+            remaining = atom_size - 8
+        else:
+            atom_size = max(16, missing)
+            target.write(b"\x00\x00\x00\x01free" + atom_size.to_bytes(8, "big"))
+            remaining = atom_size - 16
+        zeros = bytes(1024 * 1024)
+        while remaining:
+            if cancel.is_set():
+                raise Cancelled()
+            count = min(remaining, len(zeros))
+            target.write(zeros[:count])
+            remaining -= count
 
 
 def convert_media(
@@ -229,51 +370,13 @@ def convert_media(
     except OSError as error:
         raise ConversionError("This location is not writable. Please choose another output location.") from error
     temporary = Path(temporary_name)
-    process = None
     try:
-        # Write diagnostics to a temporary file so neither pipe can block FFmpeg.
-        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as log:
-            process = subprocess.Popen(
-                conversion_command(info, temporary), stdout=subprocess.PIPE, stderr=log,
-                bufsize=1, **process_options(),
-            )
-            finished = threading.Event()
-
-            def watch_cancel() -> None:
-                while not finished.wait(0.1):
-                    if cancel.is_set():
-                        stop_process(process)
-                        return
-
-            watcher = threading.Thread(target=watch_cancel, daemon=True)
-            watcher.start()
-            try:
-                progress(0 if info.duration else None, "Converting…")
-                for line in process.stdout:
-                    key, _, value = line.strip().partition("=")
-                    if key == "out_time_us":
-                        try:
-                            seconds = max(0, int(value) / 1_000_000)
-                        except ValueError:
-                            continue
-                        percent = min(99, seconds / info.duration * 100) if info.duration else None
-                        progress(percent, "Converting…")
-                    elif key == "progress" and value == "end":
-                        progress(99 if info.duration else None, "Finishing…")
-                return_code = process.wait()
-            finally:
-                finished.set()
-                watcher.join(timeout=4)
-                process.stdout.close()
-            if cancel.is_set():
-                raise Cancelled()
-            if return_code != 0 or temporary.stat().st_size == 0:
-                log.seek(0)
-                raise ConversionError(friendly_error(log.read()))
+        encode_with_size_budget(info, temporary, cancel, progress)
         progress(99, "Checking the result…")
         result = probe_media(temporary, cancel)
         if result.video_codec != "h264" or result.pixel_format != "yuv420p":
             raise ConversionError("The output could not be verified. Your original video is safe.")
+        enforce_size_range(temporary, info.size, cancel)
         if cancel.is_set():
             raise Cancelled()
         # A hard link publishes the completed file atomically without ever replacing an existing file.
@@ -302,6 +405,4 @@ def convert_media(
         progress(100, "Complete")
         return output
     finally:
-        if process is not None:
-            stop_process(process)
         temporary.unlink(missing_ok=True)
