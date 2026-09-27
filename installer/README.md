@@ -22,6 +22,8 @@ container with Windows Python 3.12 for Windows. Dependencies are installed only
 inside build containers. Source copying uses an explicit allowlist so personal
 files, Git data, and videos are not build inputs.
 
+All release packages are built locally. This project does not use GitHub Actions.
+
 ```bash
 .venv/bin/python -m pip install -r installer/requirements-build.txt
 .venv/bin/python installer/build_release.py
