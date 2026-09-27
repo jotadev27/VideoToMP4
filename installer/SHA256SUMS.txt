@@ -1,0 +1,4 @@
+662f05e7f2eace404f9b5d7dcedc334bdbc761e509e58899bbf2d2804e1eac9b  VideoToMP4-v1.0-linux-fedora-x86_64.rpm
+c96bf6b901558fd284d9aadcc9ea0d418abc8d913d9f2cf0cc362f1edaf8160a  VideoToMP4-v1.0-linux-ubuntu-amd64.deb
+3ae35ce8f3c7cb06b8d2bcfed9b56c4c4a956d35d5ac97d45d07b7fd31de59c2  VideoToMP4-v1.0-windows-portable.zip
+f00b0dad672b915d9a1b54c8de66e36be1dc145b75b4471d7fe06e68183f22b2  VideoToMP4-v1.0-windows-setup.exe

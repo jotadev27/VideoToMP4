@@ -1,0 +1,36 @@
+Video to MP4 v1.0
+
+A minimal desktop video converter by jotadev27.
+
+- White, borderless desktop interface with centered controls.
+- Drag and drop or select a local video, then click Start.
+- Saves beside the source as name_extracted1234.mp4 with four random digits.
+- Optional custom output location, live progress, cancellation, and clear errors.
+- H.264 / AAC MP4 output with original resolution and a 100–130% size range.
+- Compatible streams are copied when they fit; other codecs use two-pass encoding.
+- Original videos and existing files are never overwritten. No uploads.
+
+Downloads (x64):
+- Ubuntu 22.04+: VideoToMP4-v1.0-linux-ubuntu-amd64.deb
+- Fedora 40+: VideoToMP4-v1.0-linux-fedora-x86_64.rpm
+- Windows 10/11 installer: VideoToMP4-v1.0-windows-setup.exe
+- Windows portable: VideoToMP4-v1.0-windows-portable.zip
+- Integrity checks: SHA256SUMS.txt
+
+Windows setup is in English with custom artwork, a Start menu shortcut, and
+uninstall support. The portable version needs no installation. Windows files
+are unsigned. Extract the complete portable ZIP before starting the app.
+
+Size and quality:
+Smaller encoded files include standard MP4 padding to meet the original-size
+minimum; padding does not improve quality. Re-encoding is not guaranteed lossless.
+Odd dimensions add at most one edge pixel; HDR becomes SDR. Only the first video
+and audio tracks are included. Unsupported, damaged, or protected files show errors.
+
+Application license: MIT. Bundled dependency licenses remain applicable.
+Source: https://github.com/jotadev27/VideoToMP4
+
+Validation: automated conversion, size-bound, cancellation, and source-protection
+tests; clean Ubuntu and Fedora package installation and conversion checks;
+Windows portable conversion plus installer/uninstaller checks under Wine.
+Native Windows and real-device playback should still be checked before publishing.

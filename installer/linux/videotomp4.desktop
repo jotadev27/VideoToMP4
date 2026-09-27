@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Video to MP4
+Comment=Convert local videos to MP4
+Exec=/opt/videotomp4/VideoToMP4 %f
+Icon=videotomp4
+Terminal=false
+Categories=AudioVideo;Video;
+StartupNotify=true
+MimeType=video/mp4;video/x-matroska;video/quicktime;video/x-msvideo;video/webm;

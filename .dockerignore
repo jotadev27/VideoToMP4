@@ -1,0 +1,6 @@
+*
+!installer/
+!installer/linux/
+!installer/linux/Dockerfile
+!installer/windows/
+!installer/windows/Dockerfile
