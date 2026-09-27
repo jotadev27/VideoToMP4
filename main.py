@@ -421,6 +421,11 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    # This optional CLI check is used by release builders, outside the GUI flow.
+    smoke_test = len(sys.argv) == 3 and sys.argv[1] == "--self-test"
+    if smoke_test:
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(VERSION)
@@ -431,6 +436,16 @@ def main():
     app.setWindowIcon(QIcon(str(ROOT / "assets" / "logo.svg")))
     window = MainWindow()
     window.show()
+    if smoke_test:
+        from diagnostics import check_conversion, write_report
+        report = Path(sys.argv[2])
+        app.processEvents()
+        window.grab().save(str(report.with_suffix(".png")))
+        result = check_conversion()
+        result.update({"version": VERSION, "window": [window.width(), window.height()], "ui": "passed"})
+        write_report(report, result)
+        window.close()
+        return
     if len(sys.argv) > 1:
         window.load_video(Path(sys.argv[1]))
     sys.exit(app.exec())
