@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import sys
-import threading
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Qt, QUrl, Signal
+from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel, QMainWindow,
@@ -14,7 +13,9 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtSvgWidgets import QSvgWidget
 
-from converter import Cancelled, ConversionError, MediaInfo, convert_media, probe_media, suggested_output
+from app_info import APP_NAME, VERSION
+from converter import MediaInfo, suggested_output
+from workers import Worker
 
 
 ROOT = Path(__file__).resolve().parent
@@ -55,36 +56,6 @@ def human_duration(seconds: float | None) -> str:
     hours, remainder = divmod(total, 3600)
     minutes, secs = divmod(remainder, 60)
     return f"{hours}:{minutes:02}:{secs:02}" if hours else f"{minutes}:{secs:02}"
-
-
-class Worker(QThread):
-    detected = Signal(object)
-    completed = Signal(object)
-    failed = Signal(str)
-    cancelled = Signal()
-    progress = Signal(object, str)
-
-    def __init__(self, source: Path | None = None, info: MediaInfo | None = None, output: Path | None = None):
-        super().__init__()
-        self.source, self.info, self.output = source, info, output
-        self.cancel_event = threading.Event()
-
-    def run(self) -> None:
-        try:
-            if self.source is not None:
-                self.detected.emit(probe_media(self.source, self.cancel_event))
-            else:
-                self.completed.emit(convert_media(self.info, self.output, self.cancel_event, self.progress.emit))
-        except Cancelled:
-            self.cancelled.emit()
-        except ConversionError as error:
-            self.failed.emit(str(error))
-        except OSError as error:
-            self.failed.emit("The file could not be read or saved. Check the location and available disk space.")
-            print(f"File error: {error}", file=sys.stderr)
-        except Exception as error:
-            self.failed.emit("Something went wrong. Please try again or choose a different file.")
-            print(f"Unexpected error: {error}", file=sys.stderr)
 
 
 class WindowButton(QPushButton):
@@ -173,13 +144,15 @@ class DropArea(QWidget):
 
 
 class MainWindow(QMainWindow):
+    """Present one-file conversion and own the background worker lifecycle."""
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Video to MP4")
+        self.setWindowTitle(f"{APP_NAME} {VERSION}")
         self.setWindowIcon(QIcon(str(ROOT / "assets" / "logo.svg")))
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
-        self.resize(560, 706)
-        self.setMinimumSize(480, 706)
+        self.resize(760, 706)
+        self.setFixedSize(760, 706)
         self.setAcceptDrops(True)
         self.info: MediaInfo | None = None
         self.output: Path | None = None
@@ -197,7 +170,7 @@ class MainWindow(QMainWindow):
         root.addWidget(TitleBar(self))
 
         content = QWidget()
-        content.setMaximumWidth(456)
+        content.setMaximumWidth(540)
         layout = QVBoxLayout(content)
         layout.setContentsMargins(22, 12, 22, 22)
         layout.setSpacing(0)
@@ -243,7 +216,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setFixedWidth(224)
         layout.addWidget(self.progress_bar, alignment=Qt.AlignmentFlag.AlignHCenter)
         layout.addSpacing(12)
-        self.status = QLabel("High quality. File size may change.")
+        self.status = QLabel("Original size to +30%. Original resolution.")
         self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status.setWordWrap(True)
         self.status.setFixedHeight(52)
@@ -293,7 +266,7 @@ class MainWindow(QMainWindow):
             return
         self.info, self.output, self.result = None, None, None
         self.output_label.setText("Reading your video…")
-        self.drop.title.setText(self.fontMetrics().elidedText(path.name, Qt.TextElideMode.ElideMiddle, 360))
+        self.drop.title.setText(self.fontMetrics().elidedText(path.name, Qt.TextElideMode.ElideMiddle, 310))
         self.drop.title.setToolTip(str(path))
         self.drop.detail.setText("Checking file…")
         self.set_status("Reading your video…")
@@ -304,6 +277,7 @@ class MainWindow(QMainWindow):
         self.launch_worker(worker)
 
     def launch_worker(self, worker: Worker):
+        # Hold a strong reference until QThread.finished; never destroy a running thread.
         self.worker = worker
         worker.failed.connect(self.on_failed)
         worker.cancelled.connect(self.on_cancelled)
@@ -318,13 +292,13 @@ class MainWindow(QMainWindow):
         self.show_output()
         self.reset_progress()
         if info.video_copy:
-            self.set_status("Ready. Video quality will be preserved without re-encoding.")
+            self.set_status("Ready. Compatible video will be copied when it fits the size limit.")
         elif info.width % 2 or info.height % 2:
             self.set_status("Ready. One edge pixel will be added for MP4 compatibility.")
         elif info.hdr:
             self.set_status("Ready. HDR will be converted to SDR for broader playback support.")
         else:
-            self.set_status("Ready. Original resolution, high-quality conversion.")
+            self.set_status("Ready. Original resolution. Output size limited to +30%.")
 
     def choose_output(self):
         if self.busy or not self.info:
@@ -349,7 +323,7 @@ class MainWindow(QMainWindow):
 
     def show_output(self):
         if self.output:
-            self.output_label.setText(self.fontMetrics().elidedText(str(self.output), Qt.TextElideMode.ElideMiddle, 370))
+            self.output_label.setText(self.fontMetrics().elidedText(str(self.output), Qt.TextElideMode.ElideMiddle, 310))
             self.output_label.setToolTip(str(self.output))
 
     def start_or_cancel(self):
@@ -435,6 +409,7 @@ class MainWindow(QMainWindow):
         self.load_video(path)
 
     def closeEvent(self, event):
+        # Close only after FFmpeg stops and temporary files have been removed.
         if self.worker is not None and self.busy:
             self.close_pending = True
             self.worker.cancel_event.set()
@@ -447,7 +422,8 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName("Video to MP4")
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(VERSION)
     app.setOrganizationName("Video to MP4")
     app.setStyle("Fusion")
     app.setFont(QFont("Sans Serif", 10))
