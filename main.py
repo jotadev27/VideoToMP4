@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPen
+from PySide6.QtGui import QColor, QDesktopServices, QFontMetrics, QIcon, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel, QMainWindow,
     QProgressBar, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
@@ -16,6 +16,7 @@ from PySide6.QtSvgWidgets import QSvgWidget
 from app_info import APP_NAME, VERSION
 from converter import MediaInfo, suggested_output
 from workers import Worker
+from typography import application_font
 
 
 ROOT = Path(__file__).resolve().parent
@@ -431,7 +432,7 @@ def main():
     app.setApplicationVersion(VERSION)
     app.setOrganizationName("Video to MP4")
     app.setStyle("Fusion")
-    app.setFont(QFont("Sans Serif", 10))
+    app.setFont(application_font())
     app.setStyleSheet(STYLE)
     app.setWindowIcon(QIcon(str(ROOT / "assets" / "logo.svg")))
     window = MainWindow()
@@ -442,6 +443,7 @@ def main():
         app.processEvents()
         window.grab().save(str(report.with_suffix(".png")))
         result = check_conversion()
+        assert QFontMetrics(app.font()).inFont("A"), "The bundled font could not be loaded"
         result.update({"version": VERSION, "window": [window.width(), window.height()], "ui": "passed"})
         write_report(report, result)
         window.close()
